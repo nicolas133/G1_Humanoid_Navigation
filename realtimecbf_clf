@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+import rospy
+import math
+from nav_msgs.msg import Odometry
+
+from geometry_msgs.msg import Twist
+import numpy as np
+from numpy import array, dot
+from qpsolvers import solve_qp
+
+from std_msgs.msg import Float64
+from geometry_msgs.msg import Pose, PoseArray
+from datetime import datetime, timedelta
+import time
+import sys
+from cvxopt import matrix as cvxmat
+
+
+
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize
+from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+
+
+
+
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
+
+
+
+
+#####make robot talk ######
+from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+
+
+
+
+from qpsolvers import solve_qp
+
+
+
+
+# Function that converts quaternions to euler and returns yaw, which is the only desired value
+def quaternion_to_euler(x, y, z, w):
+   siny_cosp = 2 * (w * z + x * y)
+   cosy_cosp = 1 - 2 * (y ** 2 + z ** 2)
+   yaw = np.arctan2(siny_cosp, cosy_cosp)
+   return yaw
+
+class obstacle:
+    #initializes obj with default vals 0 for everything, 
+    #can add values to constructor call as desired
+    def __init__(object, R = 0, x = [0,0]):
+        object.R = R
+        object.x = x
+
+    #h(x) if you need h(x) without the gradient for any reason
+    def h_of_x(object):
+        return object.R**2 - ((object.x[0])**2 + ((abs(object.x[1])+1)**3)-1)
+    
+   
+    
+
+
+class CBF_safetyFilter:
+
+
+   def __init__(self,iface):
+
+       self.last_cmd_time = time.time()
+
+       self.cmd_period = 0.05
+
+       # Initializes CBF_Filter node
+       rospy.init_node('CBF_Filter', anonymous=False, log_level=rospy.DEBUG)
+
+
+
+
+       # Initializes finished value to 0, will change to 1 once robot has reached final waypoint
+       self.finished = 0
+
+
+       self.num_clusters = 0
+
+
+       ###intialize dds
+       ChannelFactoryInitialize(0, iface)
+
+
+       # subscribe to num clusters
+       rospy.Subscriber('/num_clusters', Twist, self.callback_numcluster, queue_size=10)
+
+
+       # print("reseting centroids to 0 appeasement")
+       self.centroid_xlist = np.zeros(20)
+       self.centroid_ylist = np.zeros(20)
+       self.radius_list = np.zeros(20)
+       rospy.Subscriber('/WrappedObjs', PoseArray, self.callback_wrapped, queue_size=10)
+
+
+
+
+       
+
+
+       ### create and start loco client ###
+       self.sport_client = LocoClient()
+       self.sport_client.SetTimeout(10.0)
+       self.sport_client.Init()
+       self.sport_client.Start()
+
+
+       # create subscriber
+       self.odom_sub = ChannelSubscriber("rt/odommodestate", SportModeState_)
+       self.odom_sub.Init(self.odom_handler, 10)  # 10 is the queue depth
+
+
+       ##### WAY_Point_Handiling #########
+       # self.waypoint = [[0,0], [1,-1],[0,0]]
+       # self.waypoint = [[0,0], [1,0],[1,-1],[0,-1],[0,0]]
+       self.waypoint = [[0,-2.4]]
+
+
+       self.distance_threshold = 0.07
+
+
+       # defines current goal coordinates
+       self.wayindex = 0
+       self.current_target = self.waypoint[self.wayindex]
+       self.finished = False
+       self.y_threshold = .2
+       self.x_threshold = .2
+       self.x = 0.0
+       self.y = 0.0
+       self.current_V = 0.0
+       self.SA = 0.0
+       
+
+
+       # for timing
+       self.last_time = time.time()
+
+
+   def callback_numcluster(self, msg):
+       self.num_clusters = msg.linear.x
+
+
+
+
+   def callback_wrapped(self, msg):
+       
+       self.centroid_xlist.fill(0)
+       self.centroid_ylist.fill(0)
+       self.radius_list.fill(0)
+
+
+       rospy.logdebug(f"WrappedObjs received at {rospy.Time.now()}")
+       for i, pose in enumerate(msg.poses[:3]):
+            rospy.logdebug(f"Pose[{i}]=({pose.position.x:.2f},{pose.position.y:.2f}), R={pose.position.z:.2f}")
+
+
+
+    
+
+
+       # print(msg)
+       for i, pose in enumerate(msg.poses):
+           x = pose.position.x
+           y = pose.position.y
+           z = pose.position.z
+           # print(f"Pose {i} x = {x} y = {y} z = {z}")
+           # print(x)
+           self.centroid_xlist[i] = x
+           self.centroid_ylist[i] = y
+           self.radius_list[i] = z
+
+
+   # self.centroid_x=
+   # self.centroid_y=
+   # self.radius=
+   # print(centroid_xlist)
+
+
+   def odom_handler(self, msg):
+       self.full_timer = datetime.now()
+       self.x = msg.position[0]
+       self.y = msg.position[1]
+       self.current_V = msg.velocity[0]
+       self.SA = msg.imu_state.rpy[2]
+
+
+
+
+       print(f"X={self.x}, Y={self.y}")
+
+
+
+
+   def optimizer(self):
+    n = int(self.num_clusters)
+    rospy.logdebug(f"Using {n} clusters: x={self.centroid_xlist[:n]}, y={self.centroid_ylist[:n]}")
+    rate = rospy.Rate(200) 
+    while not self.finished and not rospy.is_shutdown():
+        rospy.sleep(0)
+        print("entered run")
+        now = time.time()
+
+        ####################### Waypoint Handiling #########################
+        print("Current WAYPOINT:", self.current_target)
+        error_x = self.current_target[0] - self.x
+        error_y = self.current_target[1] - self.y
+
+        if (abs(error_x) < self.x_threshold and abs(error_y) < self.y_threshold):
+            if (self.wayindex + 1 < len(self.waypoint)):
+                self.wayindex += 1
+                self.current_target = self.waypoint[self.wayindex]
+                print("currently going towards", self.current_target)
+            else:
+                self.finished = True
+                print("Finished")
+
+        # Only iterate up to the actual data available
+        max_clusters = min(int(self.num_clusters), len(self.centroid_xlist), len(self.centroid_ylist), len(self.radius_list))
+
+        for i in range(len(self.centroid_ylist)):
+            if i >= self.num_clusters:
+                self.centroid_ylist[i] = 0
+        print(self.centroid_ylist)
+        min_y_indexes = []
+        for i in range(len(self.centroid_ylist)):
+            if (self.centroid_ylist[i] != 0):
+                min_y_indexes.append(abs(self.centroid_ylist[i]))
+        min_y_indexes = sorted(range(len(min_y_indexes)), key=lambda i: min_y_indexes[i])
+
+        ####Define First  Object#####
+        print("radius_bruh", self.radius_list[0])
+        print("centroidx", self.centroid_xlist[0])
+        print("centroidy", self.centroid_ylist[0])
+
+        safety_buffer = 8
+        circular_obstacle_list = []
+        for i in range(max_clusters):
+            circular_obstacle_list.append(
+                obstacle(R=self.radius_list[i]+safety_buffer, x=[self.centroid_xlist[i], self.centroid_ylist[i]]))
+
+        coords = np.array([self.x, self.y])
+        print(coords)
+
+        hval_list = []
+        for i in range(max_clusters):
+            hval_list.append(circular_obstacle_list[i].h_of_x())
+            print(f"Hvalue is {circular_obstacle_list[i].h_of_x()}")
+
+        x_cord = self.x
+        y_cord = self.y
+
+        ####### Define Clf ######
+        alpha = 1
+
+        clf = alpha * ((error_x) ** 2 + (error_y) ** 2)
+
+        P = np.eye(2, 2)
+        q = - np.array([1.1 * error_x, error_y])
+
+        safety_gain = 1.2
+
+        a = []
+        for i in range(max_clusters):
+            a.append([-2 * (self.centroid_xlist[i]),
+                      -3 * (self.centroid_ylist[i] + 1) ** 2])
+
+        print("CBF Derivative: ", str(a))
+        print(min_y_indexes)
+        print(self.num_clusters)
+        h_list = []
+        if (int(self.num_clusters) != 0):
+            for i in range(max_clusters):
+                h_list.append(hval_list[i] * (safety_gain / (1 + abs(self.centroid_ylist[i]))) ** 2)
+
+        # for i in range(len(h_list)):
+        #     if hval_list[i] >= -2:
+        #         hval_list[i] = abs(hval_list[i])
+        #         print("hvalue is about to go unsafe so just make it safe and trigger control")
+
+        if self.finished:
+            print("Nice BRO")
+            self.sport_client.Move(0, 0, 0.0)
+            self.sport_client.WaveHand()
+
+        # Fix QP input length to avoid shape errors
+        m = min(len(a), len(h_list))
+        a = np.array(a[:m])
+        B = 1 * np.array(h_list[:m])
+
+        qp_curr_time = datetime.now()
+
+        if m > 0:
+            g = -np.array(a, dtype=float).reshape((m, 2))
+            B = -np.array(B, dtype=float).reshape((m,))
+            x = solve_qp(P, q, g, B, solver='cvxopt')
+        else:
+            x = solve_qp(P, q, solver='cvxopt')
+
+        qp_end_time = datetime.now()
+        qp_time_interval = qp_end_time - qp_curr_time
+        print("Time interval for solving quadratic " + str(qp_time_interval))
+        full_time_interval = qp_end_time - self.full_timer
+        print("Full Time Interval :" + str(full_time_interval))
+
+        print(f"Vx command is {x[0]} the Vy command is {x[1]}")
+
+        #vx = x[0] * .05
+        #vy = x[1] * .05
+
+        now = time.time()
+        if now - self.last_cmd_time >= self.cmd_period:
+            if m > 0:
+                vx = x[0] *.08
+                vy = x[1] *.08
+                self.last_cmd_time = now 
+
+                self.sport_client.Move(vx, vy, 0.0)
+            else: 
+                vx = x[0] *.5
+                vy = x[1] *.5
+                self.last_cmd_time = now 
+
+                self.sport_client.Move(vx, vy, 0.0)
+
+
+        rate.sleep()
+        # time.sleep(.001)
+
+
+
+
+def main():
+   
+   print("new callback run--------------------------------------------------------------")
+   print("------------------------------------------------------------")
+   if len(sys.argv) < 2:
+       print(f"Usage: python3 {sys.argv[0]} networkInterface")
+       sys.exit(-1)
+   controller = CBF_safetyFilter(sys.argv[1])
+   controller.optimizer()
+
+
+3
+
+if __name__ == '__main__':
+   main()
+
+
+
+
