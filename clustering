@@ -24,7 +24,7 @@ import rospy
 import pcl
 
 
-time_delta = .006
+time_delta = .1
 
 
 class Clustering_Shaping:
@@ -35,7 +35,7 @@ class Clustering_Shaping:
         # ROS node initialization
         rospy.init_node('clustering', anonymous=True)
 
-        rospy.Subscriber("/livox/lidar", PointCloud2, self.pcl_callback, queue_size=10)
+        rospy.Subscriber("/livox/lidar", PointCloud2, self.pcl_callback, queue_size=50)
 
         # Publishers
         self.clusters_publisher = rospy.Publisher("/pcl_cluster", PointCloud2, queue_size=10)
@@ -63,9 +63,9 @@ class Clustering_Shaping:
     # --------------------------------------------------------------------------
     def filtering(self, cloud):
         filtering_time = datetime.now()
-        x_limit = 2.5
+        x_limit = 1
         x_limit_low = 0
-        y_limit = 1
+        y_limit = 1.2
         y_limitlow = 0
 
          #remove the floor
@@ -135,7 +135,7 @@ class Clustering_Shaping:
     # --------------------------------------------------------------------------
     def bounding_box(self, cloud, clusters):
         box_curr_time = datetime.now()
-        fig, ax2 = plt.subplots()
+        
         obj_array = PoseArray()
 
         for cluster in clusters:
