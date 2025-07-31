@@ -3,13 +3,17 @@ import rospy
 import math
 from nav_msgs.msg import Odometry
 
-from geometry_msgs.msg import Twist
+
 import numpy as np
 from numpy import array, dot
 from qpsolvers import solve_qp
 
 from std_msgs.msg import Float64
 from geometry_msgs.msg import Pose, PoseArray
+
+from geometry_msgs.msg import Twist,TwistStamped
+
+
 from datetime import datetime, timedelta
 import time
 import sys
@@ -23,14 +27,17 @@ from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 
 
 
+
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 
 
+import matplotlib.pyplot as plt
 
 
 #####make robot talk ######
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+
 
 
 
@@ -72,7 +79,7 @@ class CBF_safetyFilter:
        self.cmd_period = 0.05
 
        # Initializes CBF_Filter node
-       rospy.init_node('CBF_Filter', anonymous=False, log_level=rospy.DEBUG)
+       rospy.init_node('CBF_Filter', anonymous=False)
 
 
 
@@ -99,6 +106,32 @@ class CBF_safetyFilter:
        rospy.Subscriber('/WrappedObjs', PoseArray, self.callback_wrapped, queue_size=10)
 
 
+        #publish velocity commands so that we can visualize them
+       self.velocity_pub = rospy.Publisher('/cbf_velocity_cmd', TwistStamped, queue_size=10)
+
+
+
+       dummy_twist = TwistStamped()
+       dummy_twist.header.stamp = rospy.Time.now()
+       dummy_twist.header.frame_id = "livox_frame"  # or "odom", depending on your setup
+       dummy_twist.twist.linear.x = 1.0
+       dummy_twist.twist.linear.y = 1.0
+       dummy_twist.twist.linear.z = 0.0
+       self.velocity_pub.publish(dummy_twist)
+
+
+       self.robot_positions = []
+       self.velocity_commands = []
+       self.obstacle_initialized = False
+       self.initial_obstacle = None  # Will store (x, y, R)
+        # flag to start logging odom 
+       self.odom_initialized = False
+
+
+
+       rospy.sleep(1)
+
+
 
 
        
@@ -118,8 +151,8 @@ class CBF_safetyFilter:
 
        ##### WAY_Point_Handiling #########
        # self.waypoint = [[0,0], [1,-1],[0,0]]
-       # self.waypoint = [[0,0], [1,0],[1,-1],[0,-1],[0,0]]
-       self.waypoint = [[0,-2.4]]
+       #self.waypoint = [[0,0], [4,0],[3,-4],[0,-1],[0,0]]
+       self.waypoint = [[3,0]]
 
 
        self.distance_threshold = 0.07
@@ -129,8 +162,8 @@ class CBF_safetyFilter:
        self.wayindex = 0
        self.current_target = self.waypoint[self.wayindex]
        self.finished = False
-       self.y_threshold = .2
-       self.x_threshold = .2
+       self.y_threshold = .25
+       self.x_threshold = .25
        self.x = 0.0
        self.y = 0.0
        self.current_V = 0.0
@@ -140,6 +173,13 @@ class CBF_safetyFilter:
 
        # for timing
        self.last_time = time.time()
+
+      
+       
+       #used to reset the odom values 
+       self.initial_pose_x = None
+       self.initial_pose_y = None
+
 
 
    def callback_numcluster(self, msg):
@@ -154,10 +194,15 @@ class CBF_safetyFilter:
        self.centroid_ylist.fill(0)
        self.radius_list.fill(0)
 
+        # Save the first obstacle's position and radius once
+       if not self.obstacle_initialized and len(msg.poses) > 0:
+           self.initial_obstacle = (msg.poses[0].position.x,
+                                 msg.poses[0].position.y,
+                                 msg.poses[0].position.z)
+           self.obstacle_initialized = True
 
-       rospy.logdebug(f"WrappedObjs received at {rospy.Time.now()}")
-       for i, pose in enumerate(msg.poses[:3]):
-            rospy.logdebug(f"Pose[{i}]=({pose.position.x:.2f},{pose.position.y:.2f}), R={pose.position.z:.2f}")
+
+      
 
 
 
@@ -184,10 +229,21 @@ class CBF_safetyFilter:
 
    def odom_handler(self, msg):
        self.full_timer = datetime.now()
-       self.x = msg.position[0]
-       self.y = msg.position[1]
+
+       if self.odom_initialized == False:
+           self.intial_pose_x = msg.position[0]
+           self.intial_pose_y= msg.position[1]
+        
+      
+
+       self.x = msg.position[0] -self.intial_pose_x
+       self.y = msg.position[1] -self.intial_pose_y
+
+
+
        self.current_V = msg.velocity[0]
        self.SA = msg.imu_state.rpy[2]
+       self.odom_initialized=True
 
 
 
@@ -199,7 +255,7 @@ class CBF_safetyFilter:
 
    def optimizer(self):
     n = int(self.num_clusters)
-    rospy.logdebug(f"Using {n} clusters: x={self.centroid_xlist[:n]}, y={self.centroid_ylist[:n]}")
+    
     rate = rospy.Rate(200) 
     while not self.finished and not rospy.is_shutdown():
         rospy.sleep(0)
@@ -238,7 +294,7 @@ class CBF_safetyFilter:
         print("centroidx", self.centroid_xlist[0])
         print("centroidy", self.centroid_ylist[0])
 
-        safety_buffer = 8
+        safety_buffer = 1.8
         circular_obstacle_list = []
         for i in range(max_clusters):
             circular_obstacle_list.append(
@@ -255,15 +311,17 @@ class CBF_safetyFilter:
         x_cord = self.x
         y_cord = self.y
 
+       
+
         ####### Define Clf ######
         alpha = 1
 
         clf = alpha * ((error_x) ** 2 + (error_y) ** 2)
 
         P = np.eye(2, 2)
-        q = - np.array([1.1 * error_x, error_y])
+        q = - np.array([1.1 * error_x, 1.1*error_y])
 
-        safety_gain = 1.2
+        safety_gain = 3
 
         a = []
         for i in range(max_clusters):
@@ -308,7 +366,7 @@ class CBF_safetyFilter:
         full_time_interval = qp_end_time - self.full_timer
         print("Full Time Interval :" + str(full_time_interval))
 
-        print(f"Vx command is {x[0]} the Vy command is {x[1]}")
+        
 
         #vx = x[0] * .05
         #vy = x[1] * .05
@@ -316,21 +374,95 @@ class CBF_safetyFilter:
         now = time.time()
         if now - self.last_cmd_time >= self.cmd_period:
             if m > 0:
-                vx = x[0] *.08
-                vy = x[1] *.08
-                self.last_cmd_time = now 
+                vx = x[0]  * .05
+                vy = x[1] *.4
 
+                print(f"Vx command is {vx} the Vy command is {vy}")
+                
+                # Apply lower limit threshold to vx
+                if abs(vx) < 0.1 and vx != 0:
+                    print("Lower vx limit hit")
+                    vx = 0.2 if vx > 0 else -0.2
+
+                # Apply lower limit threshold to vy
+                if abs(vy) < 0.1 and vy != 0:
+                    print("Lower vy limit hit")
+                    vy = 0.2 if vy > 0 else -0.2
+        
+
+                ###### Publish to Rviz ######
+                vel_msg = TwistStamped()
+                vel_msg.header.stamp = rospy.Time.now() 
+                vel_msg.header.frame_id = "livox_frame"  # or odom, etc.
+                vel_msg.twist.linear.x = vx
+                vel_msg.twist.linear.y = vy
+                self.velocity_pub.publish(vel_msg)
+
+               
+                
                 self.sport_client.Move(vx, vy, 0.0)
+                if self.odom_initialized:
+                    self.velocity_commands.append((vx, vy))
+                    self.robot_positions.append((self.x, self.y))
             else: 
-                vx = x[0] *.5
-                vy = x[1] *.5
-                self.last_cmd_time = now 
+                vx = x[0] *.4
+                vy = x[1] *.4
 
+                self.last_cmd_time = now
+
+                print(f"Vx command is {vx} the Vy command is {vy}")
+
+                 ###### Publish to Rviz ######
+                vel_msg = TwistStamped()
+                vel_msg.header.stamp = rospy.Time.now()
+                vel_msg.header.frame_id = "livox_frame"  # or odom, etc.
+                vel_msg.twist.linear.x = vx
+                vel_msg.twist.linear.y = vy
+                self.velocity_pub.publish(vel_msg)         
+
+                
                 self.sport_client.Move(vx, vy, 0.0)
+
+                if self.odom_initialized:
+                    self.velocity_commands.append((vx, vy))
+                    self.robot_positions.append((self.x, self.y))
 
 
         rate.sleep()
         # time.sleep(.001)
+    #if self.initial_obstacle:
+    #obs_x, obs_y, obs_r = self.initial_obstacle
+
+    robot_xs, robot_ys = zip(*self.robot_positions)
+    vel_xs, vel_ys = zip(*self.velocity_commands)
+
+    fig, ax = plt.subplots()
+    ax.plot(robot_xs, robot_ys, label="Robot Path", linewidth=2)
+
+
+    downsample= 16
+
+    down_vel_xs = vel_xs[::downsample]
+    down_vel_ys = vel_ys[::downsample]
+    down_pos_xs = robot_xs[::downsample]
+    down_pos_ys = robot_ys[::downsample]
+
+    ax.quiver(down_pos_xs, down_pos_ys, down_vel_xs, down_vel_ys,angles='xy', scale_units='xy', scale=2.5, color='red', alpha=0.4, width=0.0048,headwidth=3, headlength=4.5)
+
+    #circle = plt.Circle((obs_x, obs_y), obs_r, color='red', fill=False, linestyle='--', label='Initial Obstacle')
+    #ax.add_patch(circle)
+
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlabel("X position")
+    ax.set_ylabel("Y position")
+    ax.set_title("Robot Path and Velocity Commands")
+
+    ax.set_xlim(0,3.3)
+    ax.set_ylim(1,-4)
+    #ax.legend()
+    plt.grid()
+    print('save fig')
+    plt.savefig("plot")
 
 
 
